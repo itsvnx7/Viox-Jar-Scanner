@@ -1,0 +1,576 @@
+"""
+Static detection rules for Minecraft mod malware analysis.
+All rules are pattern-based; no code is ever executed.
+"""
+import re
+from dataclasses import dataclass, field
+from enum import Enum
+
+
+class Severity(str, Enum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+
+@dataclass
+class DetectionRule:
+    id: str
+    name: str
+    severity: Severity
+    category: str
+    mitre_tactic: str
+    patterns: list[str]
+    description: str
+    plain_english: str
+    recommendation: str
+    score_weight: float  # contribution to risk score 0–100
+    file_types: list[str] = field(default_factory=lambda: ["*"])
+    case_sensitive: bool = False
+
+    def compiled(self) -> list[re.Pattern]:
+        flags = 0 if self.case_sensitive else re.IGNORECASE
+        return [re.compile(p, flags) for p in self.patterns]
+
+
+RULES: list[DetectionRule] = [
+    # ── Credential & Token Theft ─────────────────────────────────────────────
+    DetectionRule(
+        id="CRED-001",
+        name="Discord Token Harvesting",
+        severity=Severity.CRITICAL,
+        category="Credential Theft",
+        mitre_tactic="TA0006 – Credential Access",
+        patterns=[
+            r"discord[/\\]Local Storage[/\\]leveldb",
+            r"discord\.com/api/v\d+/users/@me",
+            r"Authorization:\s*[\w\-\.]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+",
+            r"mfa\.[A-Za-z0-9_\-]{84}",
+            r"getToken\(\)",
+            r"localStorage\.getItem\([\"']token[\"']\)",
+        ],
+        description="Patterns consistent with harvesting Discord authentication tokens from local storage or API calls.",
+        plain_english="This mod appears to attempt to read your Discord login token. If successful, an attacker could take over your Discord account without needing your password.",
+        recommendation="Do NOT run this mod. Delete it immediately and change your Discord password and enable 2FA.",
+        score_weight=35.0,
+    ),
+    DetectionRule(
+        id="CRED-002",
+        name="Minecraft Session Token / Access Token Theft",
+        severity=Severity.CRITICAL,
+        category="Credential Theft",
+        mitre_tactic="TA0006 – Credential Access",
+        patterns=[
+            r"launcher_accounts\.json",
+            r"launcher_profiles\.json",
+            r"accessToken",
+            r"clientToken",
+            r"authlib[- ]injector",
+            r"mojang\.com/authenticate",
+            r"sessionserver\.mojang\.com",
+            r"getAccessToken",
+            r"minecraft\.net/authenticate",
+        ],
+        description="References to Minecraft authentication tokens or launcher credential files.",
+        plain_english="This mod is trying to read your Minecraft account credentials or session token. This would let an attacker log into your Minecraft account.",
+        recommendation="Do NOT run this mod. Change your Microsoft account password immediately.",
+        score_weight=35.0,
+    ),
+    DetectionRule(
+        id="CRED-003",
+        name="Browser Credential Database Access",
+        severity=Severity.CRITICAL,
+        category="Credential Theft",
+        mitre_tactic="TA0006 – Credential Access",
+        patterns=[
+            r"Login Data",
+            r"Chrome[/\\]User Data",
+            r"Firefox[/\\]Profiles",
+            r"cookies\.sqlite",
+            r"key4\.db",
+            r"logins\.json",
+            r"wallet\.dat",
+            r"Brave-Browser[/\\]User Data",
+            r"Opera[/\\]User Data",
+        ],
+        description="References to browser credential storage locations (Chrome, Firefox, Brave, Opera).",
+        plain_english="This mod is searching for browser password databases or cookie files on your computer. This could expose passwords, credit cards, and session cookies stored in your browser.",
+        recommendation="Do NOT run this mod. If you already ran it, change all passwords stored in your browser and check for unauthorized logins.",
+        score_weight=30.0,
+    ),
+
+    # ── Exfiltration via Webhooks / Network ──────────────────────────────────
+    DetectionRule(
+        id="EXFIL-001",
+        name="Discord Webhook Exfiltration",
+        severity=Severity.CRITICAL,
+        category="Data Exfiltration",
+        mitre_tactic="TA0010 – Exfiltration",
+        patterns=[
+            r"discord\.com/api/webhooks/\d+/[\w\-]+",
+            r"discordapp\.com/api/webhooks",
+            r"ptb\.discord\.com/api/webhooks",
+            r"canary\.discord\.com/api/webhooks",
+        ],
+        description="Hardcoded Discord webhook URL found. Commonly used to send stolen data to attacker-controlled Discord channels.",
+        plain_english="A Discord webhook is embedded in this mod. Webhooks let programs post messages to Discord automatically. Malicious mods use these to send your stolen tokens, passwords, and system info to attackers.",
+        recommendation="Do NOT run this mod. The webhook destination belongs to the attacker and will receive your sensitive data.",
+        score_weight=30.0,
+    ),
+    DetectionRule(
+        id="EXFIL-002",
+        name="Suspicious External HTTP Requests",
+        severity=Severity.HIGH,
+        category="Data Exfiltration",
+        mitre_tactic="TA0010 – Exfiltration",
+        patterns=[
+            r"new URL\(\"https?://(?!api\.mojang|sessionserver\.mojang|authserver\.mojang|textures\.minecraft|optifine\.net|forge|fabricmc|curseforge|modrinth)",
+            r"HttpURLConnection",
+            r"URLConnection.*openConnection",
+            r"OkHttpClient",
+            r"java\.net\.http\.HttpClient",
+            r"requests\.post\(",
+        ],
+        description="Code performing outbound HTTP connections to non-Minecraft infrastructure.",
+        plain_english="This mod makes internet connections to servers that aren't part of Minecraft. Legitimate mods rarely need to call unknown external servers.",
+        recommendation="Investigate what data is being sent and to where before running this mod.",
+        score_weight=10.0,
+        file_types=["class", "java"],
+    ),
+    DetectionRule(
+        id="EXFIL-003",
+        name="Raw IP Address Connection",
+        severity=Severity.HIGH,
+        category="Data Exfiltration",
+        mitre_tactic="TA0010 – Exfiltration",
+        patterns=[
+            r"\b(?:\d{1,3}\.){3}\d{1,3}:\d{2,5}\b",
+            r"new Socket\(\s*\"(?:\d{1,3}\.){3}\d{1,3}\"",
+            r"InetAddress\.getByName\(\"(?:\d{1,3}\.){3}\d{1,3}\"",
+        ],
+        description="Hardcoded IP address with port used for direct socket connections.",
+        plain_english="This mod connects directly to a specific IP address, which is unusual for legitimate mods. This is a common indicator of command-and-control or data exfiltration.",
+        recommendation="Avoid running this mod. Raw IP connections bypass DNS and are harder to block.",
+        score_weight=15.0,
+    ),
+
+    # ── Remote Access / Command Execution ───────────────────────────────────
+    DetectionRule(
+        id="EXEC-001",
+        name="System Command Execution",
+        severity=Severity.CRITICAL,
+        category="Execution",
+        mitre_tactic="TA0002 – Execution",
+        patterns=[
+            r"Runtime\.getRuntime\(\)\.exec\(",
+            r"ProcessBuilder",
+            r"new Process\(",
+            r"cmd\.exe",
+            r"/bin/bash",
+            r"/bin/sh\b",
+            r"exec\([\"']cmd",
+            r"ShellExecute",
+        ],
+        description="Code that spawns system processes or executes shell commands.",
+        plain_english="This mod can run programs and system commands on your computer. Legitimate Minecraft mods never need to do this. This is a strong indicator of malware capable of running arbitrary code.",
+        recommendation="Do NOT run this mod under any circumstances.",
+        score_weight=35.0,
+    ),
+    DetectionRule(
+        id="EXEC-002",
+        name="PowerShell Invocation",
+        severity=Severity.CRITICAL,
+        category="Execution",
+        mitre_tactic="TA0002 – Execution",
+        patterns=[
+            r"powershell",
+            r"powershell\.exe",
+            r"-EncodedCommand",
+            r"-ExecutionPolicy Bypass",
+            r"-WindowStyle Hidden",
+            r"Invoke-Expression",
+            r"IEX\s*\(",
+            r"DownloadString",
+        ],
+        description="PowerShell invocation or encoded command references found.",
+        plain_english="This mod references PowerShell, a powerful Windows scripting tool. Malware uses PowerShell to download and run additional payloads silently in the background.",
+        recommendation="Do NOT run this mod. This is a classic persistence and dropper technique.",
+        score_weight=35.0,
+    ),
+    DetectionRule(
+        id="EXEC-003",
+        name="Dynamic Class Loading",
+        severity=Severity.MEDIUM,
+        category="Execution",
+        mitre_tactic="TA0002 – Execution",
+        patterns=[
+            r"ClassLoader",
+            r"URLClassLoader",
+            r"defineClass\(",
+            r"loadClass\(",
+            r"Class\.forName\(",
+            r"Instrumentation",
+            r"java\.lang\.reflect\.Method.*invoke",
+        ],
+        description="Dynamic class loading or reflection-based code execution patterns.",
+        plain_english="This mod loads and executes code dynamically at runtime. While some legitimate mods do this, it is heavily used by malware to hide its payload from static analysis.",
+        recommendation="Exercise extreme caution. Cross-reference with other findings.",
+        score_weight=12.0,
+    ),
+
+    # ── Obfuscation ──────────────────────────────────────────────────────────
+    DetectionRule(
+        id="OBFS-001",
+        name="Base64 Encoded Payload",
+        severity=Severity.LOW,
+        category="Obfuscation",
+        mitre_tactic="TA0005 – Defense Evasion",
+        patterns=[
+            r"Base64\.decode",
+            r"Base64\.getDecoder\(\)\.decode",
+            r"DatatypeConverter\.parseBase64Binary",
+            r"[A-Za-z0-9+/]{60,}={0,2}",
+        ],
+        description="Large Base64-encoded strings or Base64 decoding calls found.",
+        plain_english="This mod contains Base64-encoded data, which is a common way to hide malicious payloads. Malware often encodes its real payload in Base64 to evade detection.",
+        recommendation="Treat this as suspicious, especially combined with dynamic class loading.",
+        score_weight=10.0,
+    ),
+    DetectionRule(
+        id="OBFS-002",
+        name="String Obfuscation / XOR Encryption",
+        severity=Severity.MEDIUM,
+        category="Obfuscation",
+        mitre_tactic="TA0005 – Defense Evasion",
+        patterns=[
+            r"charAt\(\w+\)\s*\^\s*\w+",
+            r"\bxor\b",
+            r"decrypt\(",
+            r"deobfuscate\(",
+            r"StringDecryptor",
+            r"Deobf",
+            r"\\u00[0-9a-f]{2}\\u00[0-9a-f]{2}\\u00",
+        ],
+        description="String obfuscation, XOR decryption, or known deobfuscation patterns.",
+        plain_english="This mod hides some of its code using encryption or obfuscation techniques. Legitimate mods rarely need to hide what they do. This makes it harder to know what the mod will actually do.",
+        recommendation="Be suspicious. Obfuscation is a red flag that the author doesn't want you to see what the code does.",
+        score_weight=8.0,
+    ),
+    DetectionRule(
+        id="OBFS-003",
+        name="Known Java Obfuscator Signatures",
+        severity=Severity.MEDIUM,
+        category="Obfuscation",
+        mitre_tactic="TA0005 – Defense Evasion",
+        patterns=[
+            r"allatori",
+            r"zelix",
+            r"proguard",
+            r"stringer",
+            r"skidfuscator",
+            r"radon",
+            r"paramorphism",
+            r"branchlock",
+        ],
+        description="Signatures of known Java bytecode obfuscators found in class files.",
+        plain_english="This mod has been run through a code obfuscator — a tool that deliberately makes code unreadable. While some commercial mods are obfuscated to protect IP, it is a major red flag in free/community mods.",
+        recommendation="Free mods have no legitimate reason to be obfuscated. Treat with extreme suspicion.",
+        score_weight=8.0,
+    ),
+
+    # ── Filesystem Access ────────────────────────────────────────────────────
+    DetectionRule(
+        id="FS-001",
+        name="Sensitive Filesystem Path Access",
+        severity=Severity.HIGH,
+        category="Collection",
+        mitre_tactic="TA0009 – Collection",
+        patterns=[
+            r"AppData[/\\]Roaming",
+            r"AppData[/\\]Local",
+            r"System32",
+            r"\.ssh[/\\]",
+            r"id_rsa",
+            r"known_hosts",
+            r"\.gnupg[/\\]",
+            r"wallet\.dat",
+            r"keystore",
+        ],
+        description="References to sensitive filesystem locations outside of the Minecraft directory.",
+        plain_english="This mod is trying to access sensitive folders on your computer like AppData, SSH keys, or system folders. Legitimate mods only access the .minecraft directory.",
+        recommendation="Do NOT run this mod. It has no business accessing your system-level directories.",
+        score_weight=20.0,
+    ),
+    DetectionRule(
+        id="FS-002",
+        name="Minecraft Credentials Directory Access",
+        severity=Severity.CRITICAL,
+        category="Collection",
+        mitre_tactic="TA0009 – Collection",
+        patterns=[
+            r"\.minecraft[/\\]launcher_",
+            r"minecraft[/\\]launcher_accounts",
+            r"minecraft[/\\]launcher_profiles",
+            r"\.minecraft[/\\]saves",
+        ],
+        description="Direct references to Minecraft launcher credential or profile files.",
+        plain_english="This mod explicitly references the Minecraft launcher's credential files. These files contain your account tokens and could be used to steal your account.",
+        recommendation="Do NOT run this mod. This is targeted account theft.",
+        score_weight=30.0,
+    ),
+    DetectionRule(
+        id="FS-003",
+        name="File Enumeration / Directory Walking",
+        severity=Severity.MEDIUM,
+        category="Discovery",
+        mitre_tactic="TA0007 – Discovery",
+        patterns=[
+            r"Files\.walk\(",
+            r"File\.listFiles\(",
+            r"DirectoryStream",
+            r"Files\.walkFileTree",
+        ],
+        description="Code that recursively walks directories on the filesystem.",
+        plain_english="This mod scans through folders on your computer looking for files. By itself this could be benign, but combined with other findings it suggests the mod may be searching for credential or config files.",
+        recommendation="Review in context of other findings. If combined with credential indicators, treat as high risk.",
+        score_weight=5.0,
+    ),
+
+    # ── Persistence ──────────────────────────────────────────────────────────
+    DetectionRule(
+        id="PERSIST-001",
+        name="Windows Registry Modification",
+        severity=Severity.HIGH,
+        category="Persistence",
+        mitre_tactic="TA0003 – Persistence",
+        patterns=[
+            r"HKEY_CURRENT_USER",
+            r"HKCU\\\\",
+            r"HKEY_LOCAL_MACHINE",
+            r"HKLM\\\\",
+            r"Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run",
+            r"regedit",
+            r"reg\.exe",
+        ],
+        description="References to Windows Registry keys, especially startup run keys.",
+        plain_english="This mod appears to modify the Windows Registry. Malware uses this to make itself run every time you start your computer.",
+        recommendation="Do NOT run this mod. Registry-based persistence is a hallmark of malware.",
+        score_weight=20.0,
+    ),
+    DetectionRule(
+        id="PERSIST-002",
+        name="Startup / Scheduled Task Creation",
+        severity=Severity.HIGH,
+        category="Persistence",
+        mitre_tactic="TA0003 – Persistence",
+        patterns=[
+            r"schtasks",
+            r"Task Scheduler",
+            r"ITaskScheduler",
+            r"Startup[/\\]",
+            r"shell:startup",
+            r"cron",
+        ],
+        description="References to Windows Task Scheduler or startup folder manipulation.",
+        plain_english="This mod tries to schedule itself to run automatically or add itself to the Windows startup folder. This is how malware persists after you close Minecraft.",
+        recommendation="Do NOT run this mod.",
+        score_weight=20.0,
+    ),
+
+    # ── Hypixel / Skyblock Specific ──────────────────────────────────────────
+    DetectionRule(
+        id="HYPE-001",
+        name="Hypixel API Key Theft",
+        severity=Severity.CRITICAL,
+        category="Credential Theft",
+        mitre_tactic="TA0006 – Credential Access",
+        patterns=[
+            r"api\.hypixel\.net",
+            r"hypixel.*api.*key",
+            r"api-key",
+            r"/key",
+            r"hypixelApiKey",
+        ],
+        description="References to the Hypixel API or API key patterns.",
+        plain_english="This mod appears to target your Hypixel API key. With your API key, attackers can look up your private stats, auction data, and linked account information.",
+        recommendation="Do NOT run this mod. If you already did, regenerate your Hypixel API key with /api new.",
+        score_weight=15.0,
+    ),
+    DetectionRule(
+        id="HYPE-002",
+        name="Skyblock Inventory / Item Data Collection",
+        severity=Severity.MEDIUM,
+        category="Collection",
+        mitre_tactic="TA0009 – Collection",
+        patterns=[
+            r"skyblock.*inventory",
+            r"nbt.*skyblock",
+            r"ExtraAttributes",
+            r"ItemLore",
+            r"getInventoryContents",
+        ],
+        description="Patterns suggesting collection of Skyblock inventory NBT data beyond normal display.",
+        plain_english="This mod collects detailed Skyblock inventory data in ways not typical of legitimate mods. Some mods use this data to steal information about your high-value items.",
+        recommendation="Low risk by itself, but review in context of network indicators.",
+        score_weight=5.0,
+    ),
+
+    # ── Suspicious Network Indicators ────────────────────────────────────────
+    DetectionRule(
+        id="NET-001",
+        name="Hardcoded Non-Standard Port",
+        severity=Severity.MEDIUM,
+        category="Command and Control",
+        mitre_tactic="TA0011 – Command and Control",
+        patterns=[
+            r":\s*(?:4444|1234|31337|8888|9999|6667|6666)\b",
+            r"new Socket\([^)]+,\s*(?:4444|1234|31337|8888|9999)\)",
+        ],
+        description="References to non-standard ports commonly associated with RATs and reverse shells.",
+        plain_english="This mod uses network ports that are commonly associated with hacking tools and remote access trojans (like port 4444 or 31337). Legitimate mods do not use these ports.",
+        recommendation="Treat as high risk. These ports have no legitimate use in a Minecraft mod.",
+        score_weight=12.0,
+    ),
+    DetectionRule(
+        id="NET-002",
+        name="DNS Tunneling / Covert Channel",
+        severity=Severity.HIGH,
+        category="Command and Control",
+        mitre_tactic="TA0011 – Command and Control",
+        patterns=[
+            r"InetAddress\.getAllByName",
+            r"dnsQuery",
+            r"txt.*record",
+            r"java\.net\.InetAddress.*getAllByName",
+        ],
+        description="Patterns suggesting use of DNS for covert communication or data exfiltration.",
+        plain_english="This mod may use DNS queries to hide communications with attackers. DNS tunneling is an advanced technique used by malware to bypass firewalls.",
+        recommendation="Treat as suspicious. Combine with other findings to assess severity.",
+        score_weight=10.0,
+    ),
+
+    # ── Suspicious Java Patterns ─────────────────────────────────────────────
+    DetectionRule(
+        id="JAVA-001",
+        name="Native Library Loading",
+        severity=Severity.HIGH,
+        category="Execution",
+        mitre_tactic="TA0002 – Execution",
+        patterns=[
+            r"System\.loadLibrary\(",
+            r"System\.load\(",
+            r"Runtime\.load\(",
+            r"\.dll\"",
+            r"\.so\"",
+            r"\.dylib\"",
+        ],
+        description="Loading of native shared libraries (.dll, .so, .dylib).",
+        plain_english="This mod loads native code from a .dll or .so file, which escapes Java's sandbox. Native libraries can do anything the operating system allows and are very dangerous if malicious.",
+        recommendation="Do NOT run this mod without understanding exactly which native library it loads and why.",
+        score_weight=15.0,
+    ),
+    DetectionRule(
+        id="JAVA-002",
+        name="Clipboard Access",
+        severity=Severity.MEDIUM,
+        category="Collection",
+        mitre_tactic="TA0009 – Collection",
+        patterns=[
+            r"Toolkit\.getDefaultToolkit\(\)\.getSystemClipboard",
+            r"Clipboard",
+            r"DataFlavor",
+            r"getContents\(",
+            r"setContents\(",
+        ],
+        description="Access to the system clipboard.",
+        plain_english="This mod reads or modifies your clipboard. Malware uses this to steal copied passwords, crypto addresses, and other sensitive data, or to swap out copied crypto wallet addresses (clipboard hijacking).",
+        recommendation="Clipboard access is very unusual for a Minecraft mod. Treat as suspicious.",
+        score_weight=8.0,
+    ),
+    DetectionRule(
+        id="JAVA-003",
+        name="Screen Capture",
+        severity=Severity.HIGH,
+        category="Collection",
+        mitre_tactic="TA0009 – Collection",
+        patterns=[
+            r"Robot\(\)",
+            r"createScreenCapture",
+            r"screenshot",
+            r"getScreenShot",
+            r"BufferedImage.*screen",
+        ],
+        description="Screen capture or screenshot functionality beyond Minecraft's own screenshot key.",
+        plain_english="This mod can take screenshots of your screen programmatically. This could be used to capture passwords, private chats, or authentication codes displayed on your screen.",
+        recommendation="Very unusual for a Minecraft mod. Only legitimate if this is a HUD/recording mod from a trusted source.",
+        score_weight=12.0,
+    ),
+    DetectionRule(
+        id="JAVA-004",
+        name="Keylogger Indicators",
+        severity=Severity.CRITICAL,
+        category="Collection",
+        mitre_tactic="TA0009 – Collection",
+        patterns=[
+            r"KeyListener",
+            r"addKeyListener",
+            r"keyTyped\(",
+            r"GlobalKeyListener",
+            r"JNativeHook",
+            r"NativeKeyListener",
+        ],
+        description="Global key listener or keylogger-like patterns outside of expected Minecraft input handling.",
+        plain_english="This mod may be logging your keystrokes. A keylogger records everything you type, including passwords, chat messages, and credit card numbers.",
+        recommendation="Do NOT run this mod. Global key listeners have no place in a Minecraft mod.",
+        score_weight=25.0,
+        file_types=["class", "java"],
+    ),
+
+    # ── Known Malicious Strings ──────────────────────────────────────────────
+    DetectionRule(
+        id="SIG-001",
+        name="Known RAT / Stealer Strings",
+        severity=Severity.CRITICAL,
+        category="Malware Signature",
+        mitre_tactic="TA0040 – Impact",
+        patterns=[
+            r"NecroBot",
+            r"Stealer",
+            r"RAT\b",
+            r"Grabber",
+            r"token.?grab",
+            r"AccountStealer",
+            r"CookieStealer",
+            r"WhaleStealer",
+            r"GenericStealer",
+        ],
+        description="String literals matching known malware family names or categories.",
+        plain_english="This mod contains class names or strings that directly reference malware categories like 'Stealer', 'RAT', or 'Grabber'. This is a very strong indicator of malicious code.",
+        recommendation="Do NOT run this mod. Delete it immediately.",
+        score_weight=40.0,
+        case_sensitive=False,
+    ),
+    DetectionRule(
+        id="SIG-002",
+        name="Self-Destruct / Evidence Deletion",
+        severity=Severity.HIGH,
+        category="Defense Evasion",
+        mitre_tactic="TA0005 – Defense Evasion",
+        patterns=[
+            r"deleteOnExit\(\)",
+            r"File\.delete\(\)",
+            r"Files\.delete\(",
+            r"self.?delete",
+            r"cleanUp\(\)",
+            r"removeSelf",
+        ],
+        description="Code that deletes files at runtime, potentially to cover its tracks.",
+        plain_english="This mod deletes files while running, which can be a way to cover its tracks after stealing data. Legitimate mods rarely delete their own files.",
+        recommendation="Suspicious, especially combined with exfiltration indicators.",
+        score_weight=8.0,
+    ),
+]
+
+# Build a lookup by rule ID
+RULES_BY_ID: dict[str, DetectionRule] = {r.id: r for r in RULES}
